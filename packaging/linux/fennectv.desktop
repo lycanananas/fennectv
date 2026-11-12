@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=FennecTV
+GenericName=HF television receiver
+Comment=Receives FennecTV over a Data2G host and shows the picture
+Exec=fennectv-rx --play
+Icon=fennectv
+Terminal=false
+Categories=AudioVideo;Video;HamRadio;
+Keywords=Data2G;ham;radio;HF;SSTV;FSTV;

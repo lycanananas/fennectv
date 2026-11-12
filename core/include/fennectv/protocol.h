@@ -1,23 +1,38 @@
 // What FennecTV puts on the air (docs/PLAN.md, "On the air").
 //
 // One Data2G burst carries a few closed GOPs back to back, the rest of it
-// zeros, cut into KISS frames with a 4-byte header. Data2G's LDPC and CRC
-// look after each codeword and nothing more is added: a lost frame loses
+// zeros, cut into KISS frames with a 2- or 3-byte header. Data2G's LDPC and
+// CRC look after each codeword and nothing more is added: a lost frame loses
 // what it carried, and the receiver picks up again at the next GOP that
-// starts in a frame it has (the header says where). No sockets, no clock,
-// no FFmpeg.
+// starts in a frame it has (the header says where). Every byte counts: no
+// field the receiver can do without, and the version is in the group's name
+// (Data2G sends that in the control codeword anyway, and masks every CRC
+// with it: another version's bursts never reach us).
 //
-// Frame:  [version 4 | codec 4][burst][idx 7 | last 1][GOP start][payload]
-//   burst      the burst's number, wraps
+// Frame:  [codec 2 | start 1 | burst 5][last 1 | idx 7]([GOP start])[payload]
+//   codec      1 AV1, 3 VVC
+//   burst      the burst's number, mod 32
 //   idx        the frame's place in the burst; last set on the burst's last
-//   GOP start  where in the payload the first GOP header begins, 0xFF none
+//   start      a GOP begins in this frame: the GOP start byte follows,
+//              where in the payload the first one does
+// Frames are all as long as the mode's; one with a GOP start carries a
+// byte less of payload.
 //
 // The burst's bytes, frame payloads end to end:
-//   GOP        [0x80][fps][first][count][burst pictures][OSD length][OSD]
-//              then `count` units, each [size, LEB128][unit], in decode
-//              order: an AV1 temporal unit without its temporal delimiter,
-//              or a VVC access unit as [size, LEB128][NAL unit]s, no start
-//              codes, no SEI, no access unit delimiter
+//   GOP        [count][first][fps][burst pictures][OSD length][OSD]
+//              then `count` units in decode order, each its own length:
+//              AV1   its OBUs less temporal delimiters and padding, each
+//                    [(payload length << 3 | kind << 1 | more), LEB128]
+//                    ([OBU header])[payload]: kind 0 frame, 1 frame
+//                    header, 2 sequence header (header implied), 3 other
+//                    (header and extension follow); more clear on the last
+//              VVC   its NAL units, each [(length << 1 | more), LEB128]
+//                    [the NAL unit less its first byte (0: one layer)],
+//                    more clear on the last; no SEI, no access unit
+//                    delimiter, no start codes
+//              count is never 0; the OSD only in the burst's first GOP,
+//              and the sequence's parameters (AV1 sequence header, VVC
+//              SPS and PPS) only in its first unit
 //   ...        more GOPs
 //   zeros      to the end of the burst
 #ifndef FENNECTV_PROTOCOL_H
@@ -36,15 +51,17 @@ using Bytes = std::vector<uint8_t>;
 
 // The broadcast group FennecTV opens on data2g-host: up to 10 characters,
 // never a valid callsign (Data2G docs/broadcast.md, 1).
-inline constexpr const char* GROUP = "FENNECTV";
+// The version is its last digit: "FENNECTV4" is protocol 4.
+inline constexpr const char* GROUP = "FENNECTV4";
 
-inline constexpr uint8_t PROTOCOL_VERSION = 3;
-inline constexpr size_t FRAME_HEADER_BYTES = 4;
+// A frame's header without the GOP start byte, and with it.
+inline constexpr size_t FRAME_HEADER_BYTES = 2;
+inline constexpr size_t FRAME_HEADER_MAX = 3;
+inline constexpr int BURST_NUMBERS = 32;
 // The longest frame every Data2G data mode carries (KISS PACLEN, less one).
 inline constexpr size_t MAX_FRAME_BYTES = 255;
 inline constexpr int MAX_BURST_FRAMES = 128;
 inline constexpr uint8_t NO_GOP_START = 0xFF;
-inline constexpr uint8_t GOP_MARK = 0x80;
 
 enum class Codec : uint8_t
 {
@@ -72,9 +89,8 @@ enum class PixelFormat : uint8_t
 
 struct FrameHeader
 {
-    uint8_t version = PROTOCOL_VERSION;
     Codec codec = Codec::Av1;
-    uint8_t burst = 0;
+    uint8_t burst = 0;  // mod BURST_NUMBERS on the air
     uint8_t idx = 0;  // below MAX_BURST_FRAMES
     bool last = false;
     uint8_t gopStart = NO_GOP_START;
@@ -88,8 +104,8 @@ struct DecodedFrame
     Bytes payload;
 };
 
-// Nothing for a frame too short, of another version, or whose GOP start
-// lies outside its payload.
+// Nothing for a frame too short, of no codec, or whose GOP start lies
+// outside its payload.
 std::optional<DecodedFrame> decodeFrame(const Bytes& frame);
 
 //-------------------------------------------------------------------------
@@ -109,16 +125,44 @@ struct Gop
 {
     GopHeader header;
     std::vector<Bytes> units;  // as the encoder gave them, one a picture, decode order
+    // The sequence's parameters go with this GOP (the burst's first);
+    // else they're left out and the receiver uses the last it had.
+    bool params = true;
+};
+
+// The sequence's parameters in a unit (AV1 sequence header OBUs; VVC OPI,
+// DCI, VPS, SPS and PPS), as the decoder takes them; empty if none. They
+// don't change while a transmission lasts, so they go once a burst, and
+// never twice in a GOP.
+Bytes paramsOf(Codec codec, const Bytes& unit);
+Bytes withoutParams(Codec codec, const Bytes& unit);
+// The unit (as fromAir gives it) with the parameters in front of the rest.
+Bytes withParams(Codec codec, const Bytes& unit, const Bytes& params);
+
+// What a receiver keeps between bursts: the last parameters a codec sent.
+struct ParamCache
+{
+    Bytes av1, vvc;
+    Bytes& of(Codec codec) { return codec == Codec::Vvc ? vvc : av1; }
 };
 
 // A unit as it goes on the air, and back as the decoder takes it.
 Bytes toAir(Codec codec, const Bytes& unit);
 Bytes fromAir(Codec codec, const Bytes& air);
+// A GOP's units as they go on the air: the parameters left out of all
+// but the first unit, and out of that too without `params`.
+std::vector<Bytes> gopToAir(Codec codec, const std::vector<Bytes>& units, bool params);
 // What a GOP takes of a burst.
-size_t gopBytes(Codec codec, const GopHeader& header, const std::vector<Bytes>& units);
+size_t gopBytes(Codec codec, const GopHeader& header, const std::vector<Bytes>& units, bool params = true);
 
-// The burst's frames: the GOPs end to end in `frames` payloads of
-// payloadBytes each, zero padded. Nothing when they don't fit.
+// What a burst of `frames` frames carries with `gops` GOPs in it, at the
+// least (frames of payloadBytes, the frame less FRAME_HEADER_BYTES, a byte
+// less where a GOP starts).
+size_t burstCapacity(size_t payloadBytes, int frames, int gops);
+
+// The burst's frames: the GOPs end to end in `frames` frames of
+// FRAME_HEADER_BYTES + payloadBytes each, zero padded. Nothing when they
+// don't fit.
 std::optional<std::vector<Bytes>> packBurst(uint8_t burst, Codec codec, const std::vector<Gop>& gops,
                                             size_t payloadBytes, int frames);
 
@@ -132,8 +176,11 @@ struct ReceivedGop
 
 // What a receiver makes of a burst: frames by idx, missing ones empty.
 // Every GOP whose header arrived comes back with its units up to the
-// first lost byte.
-std::vector<ReceivedGop> parseBurst(const std::vector<std::optional<DecodedFrame>>& frames);
+// first lost byte. A GOP that came without the parameters gets the last
+// ones the cache (if given; else this burst) has; one that brings them
+// updates it.
+std::vector<ReceivedGop> parseBurst(const std::vector<std::optional<DecodedFrame>>& frames,
+                                    ParamCache* cache = nullptr);
 
 } // namespace fennectv
 

@@ -9,6 +9,7 @@
 #include <sstream>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace fennectv
 {
@@ -27,16 +28,24 @@ public:
                 bad_ = "unexpected argument: " + a;
                 return;
             }
-            std::string name = a.substr(2);
+            std::string name = a.substr(2), value;
             auto eq = name.find('=');
             if (eq != std::string::npos)
-                values_[name.substr(0, eq)] = name.substr(eq + 1);
+            {
+                value = name.substr(eq + 1);
+                name = name.substr(0, eq);
+            }
             else if (flags.count(name))
-                values_[name] = "1";
+                value = "1";
             else if (i + 1 < argc)
-                values_[name] = argv[++i];
+                value = argv[++i];
             else
+            {
                 bad_ = "--" + name + " needs a value";
+                return;
+            }
+            values_[name] = value;  // the last one wins
+            every_[name].push_back(value);
         }
     }
 
@@ -63,9 +72,16 @@ public:
         return d;
     }
     int integer(const std::string& n, int def) const { return (int)num(n, def); }
+    // Every value an option was given, in order (--param a=1 --param b=2).
+    std::vector<std::string> all(const std::string& n) const
+    {
+        auto it = every_.find(n);
+        return it == every_.end() ? std::vector<std::string>{} : it->second;
+    }
 
 private:
     std::map<std::string, std::string> values_;
+    std::map<std::string, std::vector<std::string>> every_;
     std::string bad_;
 };
 

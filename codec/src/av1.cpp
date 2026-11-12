@@ -1,4 +1,7 @@
-// AV1 through libaom: good quality, cpu-used 0, two-pass.
+// AV1 through libaom: good quality, cpu-used 2, constant quantizer. Its
+// rate control (two-pass VBR) cost 2.2 dB at these rates: the GOP is coded
+// at a quantizer instead, the one that fills the GOP's room found by
+// encodeToFit.
 #include "fennectv/codec.h"
 
 #include <aom/aom_decoder.h>
@@ -8,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 namespace fennectv
@@ -15,11 +19,6 @@ namespace fennectv
 
 namespace
 {
-
-// libaom takes its target in whole kbps, far too coarse at 2-8 kbps. The
-// encoder is told each picture lasts 1/TICKS s instead of 1/fps, so the
-// same bits per GOP read as a large, finely set kbps figure.
-constexpr int TICKS = 1000;
 
 using detail::setError;
 
@@ -70,34 +69,32 @@ class Av1Encoder : public Encoder
 public:
     Av1Encoder(const VideoFormat& format, const EncoderOptions& options) : format_(format), options_(options) {}
 
-    bool prepare(const std::vector<Picture>& pictures, std::string* error) override
+    Aim aim() const override { return Aim::Quantizer; }
+    // cq-level; below 8 nothing at these rates
+    void quantizers(int& lowest, int& highest) const override
     {
-        stats_.clear();
-        return run(pictures, 1, nullptr, 1000.0 * pictures.size(), nullptr, &stats_, error);
+        lowest = 8;
+        highest = 63;
     }
 
-    bool encode(const std::vector<Picture>& pictures, double bitsForGop, std::vector<Bytes>& units,
+    bool prepare(const std::vector<Picture>&, std::string*) override { return true; }
+
+    bool encode(const std::vector<Picture>& pictures, double at, std::vector<Bytes>& units,
                 std::string* error) override
     {
-        if (stats_.empty() && !prepare(pictures, error)) return false;
-        return run(pictures, 2, &stats_, bitsForGop, &units, nullptr, error) && !units.empty();
+        return run(pictures, (int)std::lround(at), units, error) && !units.empty();
     }
 
 private:
-    bool run(const std::vector<Picture>& pictures, int pass, const std::vector<uint8_t>* statsIn, double bitsForGop,
-             std::vector<Bytes>* packets, std::vector<uint8_t>* statsOut, std::string* error);
+    bool run(const std::vector<Picture>& pictures, int cq, std::vector<Bytes>& packets, std::string* error);
 
     VideoFormat format_;
     EncoderOptions options_;
-    std::vector<uint8_t> stats_;
 };
 
-bool Av1Encoder::run(const std::vector<Picture>& pictures, int pass, const std::vector<uint8_t>* statsIn,
-                     double bitsForGop, std::vector<Bytes>* packets, std::vector<uint8_t>* statsOut,
-                     std::string* error)
+bool Av1Encoder::run(const std::vector<Picture>& pictures, int cq, std::vector<Bytes>& packets, std::string* error)
 {
-    if (packets) packets->clear();
-    if (statsOut) statsOut->clear();
+    packets.clear();
     if (pictures.empty())
     {
         setError(error, "no pictures");
@@ -116,27 +113,17 @@ bool Av1Encoder::run(const std::vector<Picture>& pictures, int pass, const std::
     cfg.g_h = (unsigned)format_.height;
     cfg.g_profile = profile(px);
     cfg.monochrome = px == PixelFormat::Gray;
-    cfg.g_timebase = {1, TICKS};
-    cfg.g_threads = 1;         // GOPs run side by side instead
+    cfg.g_timebase = {1, format_.fps};
+    cfg.g_threads = 1;  // GOPs run side by side instead
     // B frames: libaom looks ahead over the GOP and codes alt-ref pictures
     // (shown later) that the pictures before them refer to.
     cfg.g_lag_in_frames = options_.bFrames ? (unsigned)std::min(n, 35) : 0;
-    cfg.g_pass = pass == 1 ? AOM_RC_FIRST_PASS : AOM_RC_LAST_PASS;
-    cfg.rc_end_usage = AOM_VBR;
-    // bits for the GOP over the n ticks it lasts, in kbps
-    double kbps = bitsForGop * TICKS / n / 1000.0;
-    cfg.rc_target_bitrate = (unsigned)std::max(1.0, std::round(kbps));
-    cfg.rc_undershoot_pct = 100;
-    cfg.rc_overshoot_pct = 10;
-    // The rate buffer spans the GOP (n ticks of a millisecond).
-    cfg.rc_buf_sz = cfg.rc_buf_initial_sz = cfg.rc_buf_optimal_sz = (unsigned)n;
+    cfg.g_pass = AOM_RC_ONE_PASS;
+    cfg.rc_end_usage = AOM_Q;
+    cfg.rc_min_quantizer = 0;
+    cfg.rc_max_quantizer = 63;
     cfg.kf_mode = AOM_KF_DISABLED;  // one keyframe, the first, forced below
     cfg.kf_min_dist = cfg.kf_max_dist = (unsigned)n;
-    if (statsIn)
-    {
-        cfg.rc_twopass_stats_in.buf = const_cast<uint8_t*>(statsIn->data());
-        cfg.rc_twopass_stats_in.sz = statsIn->size();
-    }
 
     aom_codec_ctx_t ctx;
     if (aom_codec_enc_init(&ctx, iface, &cfg, 0) != AOM_CODEC_OK)
@@ -144,7 +131,9 @@ bool Av1Encoder::run(const std::vector<Picture>& pictures, int pass, const std::
         setError(error, aomError(&ctx, "libaom init"));
         return false;
     }
-    aom_codec_control(&ctx, AOME_SET_CPUUSED, 0);  // the slowest: we have the CPU
+    // cpu-used 2 unless told otherwise: as good as 0 here, four times as fast
+    aom_codec_control(&ctx, AOME_SET_CPUUSED, options_.preset.empty() ? 2 : std::atoi(options_.preset.c_str()));
+    aom_codec_control(&ctx, AOME_SET_CQ_LEVEL, (unsigned)std::clamp(cq, 0, 63));
     aom_codec_control(&ctx, AOME_SET_ENABLEAUTOALTREF, options_.bFrames ? 1u : 0u);
     if (px == PixelFormat::Rgb)
     {
@@ -156,6 +145,16 @@ bool Av1Encoder::run(const std::vector<Picture>& pictures, int pass, const std::
     else
     {
         aom_codec_control(&ctx, AV1E_SET_COLOR_RANGE, (int)AOM_CR_STUDIO_RANGE);
+    }
+
+    for (const auto& [key, value] : options_.params)
+    {
+        if (aom_codec_set_option(&ctx, key.c_str(), value.c_str()) != AOM_CODEC_OK)
+        {
+            setError(error, aomError(&ctx, ("libaom " + key + "=" + value).c_str()));
+            aom_codec_destroy(&ctx);
+            return false;
+        }
     }
 
     aom_image_t img;
@@ -180,15 +179,10 @@ bool Av1Encoder::run(const std::vector<Picture>& pictures, int pass, const std::
         aom_codec_iter_t it = nullptr;
         while (const aom_codec_cx_pkt_t* pkt = aom_codec_get_cx_data(&ctx, &it))
         {
-            if (pkt->kind == AOM_CODEC_CX_FRAME_PKT && packets)
+            if (pkt->kind == AOM_CODEC_CX_FRAME_PKT)
             {
                 const uint8_t* b = static_cast<const uint8_t*>(pkt->data.frame.buf);
-                packets->emplace_back(b, b + pkt->data.frame.sz);
-            }
-            else if (pkt->kind == AOM_CODEC_STATS_PKT && statsOut)
-            {
-                const uint8_t* b = static_cast<const uint8_t*>(pkt->data.twopass_stats.buf);
-                statsOut->insert(statsOut->end(), b, b + pkt->data.twopass_stats.sz);
+                packets.emplace_back(b, b + pkt->data.frame.sz);
             }
         }
     };
@@ -226,10 +220,9 @@ bool Av1Encoder::run(const std::vector<Picture>& pictures, int pass, const std::
             ok = false;
             break;
         }
-        size_t before = (packets ? packets->size() : 0) + (statsOut ? statsOut->size() : 0);
+        size_t before = packets.size();
         collect();
-        size_t after = (packets ? packets->size() : 0) + (statsOut ? statsOut->size() : 0);
-        if (after == before) break;
+        if (packets.size() == before) break;
     }
     aom_img_free(&img);
     aom_codec_destroy(&ctx);

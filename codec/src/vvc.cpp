@@ -1,5 +1,6 @@
-// VVC (H.266) through Fraunhofer's VVenC and VVdeC: preset slower, two-pass
-// rate control, 10 bits inside. B frames: random access with a closed
+// VVC (H.266) through Fraunhofer's VVenC and VVdeC: preset slow (slower is
+// 4x the time for 0.1 dB), no perceptual QP adaptation (0.9 dB PSNR and a
+// better SSIM at these sizes), two-pass rate control, 10 bits inside. B frames: random access with a closed
 // GOP (an IDR first, pictures coded out of order in hierarchical groups);
 // without them, low delay (forward references only).
 #include <vvdec/vvdec.h>
@@ -55,8 +56,29 @@ public:
         const double seconds = n / (double)format_.fps;
         const int bps = std::max(100, (int)std::lround(bitsForGop / seconds));
 
+        // The preset goes in with the defaults (set afterwards as a
+        // parameter it changes nothing).
+        static const std::pair<const char*, vvencPresetMode> PRESETS[] = {
+            {"faster", VVENC_FASTER}, {"fast", VVENC_FAST}, {"medium", VVENC_MEDIUM},
+            {"slow", VVENC_SLOW},     {"slower", VVENC_SLOWER}};
+        vvencPresetMode preset = VVENC_SLOW;
+        if (!options_.preset.empty())
+        {
+            bool known = false;
+            for (const auto& [name, mode] : PRESETS)
+                if (options_.preset == name)
+                {
+                    preset = mode;
+                    known = true;
+                }
+            if (!known)
+            {
+                setError(error, "vvenc: no preset " + options_.preset + " (faster, fast, medium, slow, slower)");
+                return false;
+            }
+        }
         vvenc_config c;
-        vvenc_init_default(&c, w, h, format_.fps, bps, 32, VVENC_SLOWER);
+        vvenc_init_default(&c, w, h, format_.fps, bps, 32, preset);
         vvenc_set_msg_callback(&c, nullptr, quiet);
         c.m_verbosity = VVENC_SILENT;
         c.m_internChromaFormat = chromaOf(format_.pixels);
@@ -68,6 +90,14 @@ public:
         c.m_framesToBeEncoded = n;
         c.m_RCNumPasses = 2;
         c.m_poc0idr = true;
+        c.m_usePerceptQPA = false;  // --param qpa=1 brings it back
+        // The SPS goes once a burst and must be the same for every GOP:
+        // nothing in it that follows the bit rate (HRD) or that we don't
+        // read (VUI), and a fixed level (2: 160x120 at 30 fps is level 1).
+        c.m_hrdParametersPresent = false;
+        c.m_bufferingPeriodSEIEnabled = false;
+        c.m_vuiParametersPresent = 0;
+        c.m_level = VVENC_LEVEL2;
         c.m_IntraPeriod = 256;  // past the GOP: its first picture is the only I
         if (options_.bFrames)
         {
@@ -80,6 +110,15 @@ public:
             c.m_picReordering = false;
             c.m_GOPSize = 8;
             c.m_DecodingRefreshType = VVENC_DRT_NONE;
+        }
+
+        for (const auto& [key, value] : options_.params)
+        {
+            if (vvenc_set_param(&c, key.c_str(), value.c_str()) != 0)
+            {
+                setError(error, "vvenc: can't set " + key + "=" + value);
+                return false;
+            }
         }
 
         vvencEncoder* enc = vvenc_encoder_create();

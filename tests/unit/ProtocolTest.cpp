@@ -45,7 +45,7 @@ std::vector<Gop> someGops(std::mt19937& rng, int gops, int perGop)
         gop.header.first = (uint8_t)(g * perGop);
         gop.header.count = (uint8_t)perGop;
         gop.header.burstPictures = (uint8_t)(gops * perGop);
-        gop.header.osd = "N0CALL";
+        if (g == 0) gop.header.osd = "N0CALL";  // once a burst
         for (int i = 0; i < perGop; i++) gop.units.push_back(picture(rng, i == 0 ? 700 : 40 + rng() % 150, i == 0));
         out.push_back(std::move(gop));
     }
@@ -64,33 +64,54 @@ std::vector<std::optional<DecodedFrame>> receive(const std::vector<Bytes>& frame
     return got;
 }
 
-// The frame holding byte `pos` of the burst.
-int frameAt(size_t pos, size_t payload) { return (int)(pos / payload); }
+// The frame holding byte `pos` of the burst (payloads differ: a byte
+// less where a GOP starts).
+int frameAt(const std::vector<Bytes>& frames, size_t pos)
+{
+    size_t at = 0;
+    for (size_t i = 0; i < frames.size(); i++)
+    {
+        at += decodeFrame(frames[i])->payload.size();
+        if (pos < at) return (int)i;
+    }
+    return (int)frames.size();
+}
 
 void frames()
 {
     FrameHeader h;
-    h.burst = 200;
+    h.burst = 200;  // 8 on the air
     h.idx = 77;
     h.last = true;
     h.gopStart = 12;
-    Bytes payload(141, 0x5a);
+    Bytes payload(142, 0x5a);
     Bytes f = encodeFrame(h, payload.data(), payload.size());
     CHECK_EQ(f.size(), (size_t)145);
-    CHECK_EQ(FRAME_HEADER_BYTES, (size_t)4);
+    CHECK_EQ(FRAME_HEADER_BYTES, (size_t)2);
     auto d = decodeFrame(f);
     CHECK(d.has_value());
-    CHECK(d->header.version == PROTOCOL_VERSION && d->header.codec == Codec::Av1);
-    CHECK(d->header.burst == 200 && d->header.idx == 77 && d->header.last && d->header.gopStart == 12);
+    CHECK(d->header.codec == Codec::Av1);
+    CHECK(d->header.burst == 8 && d->header.idx == 77 && d->header.last && d->header.gopStart == 12);
     CHECK(d->payload == payload);
 
-    Bytes old = f;
-    old[0] = (uint8_t)(1 << 4 | 1);  // version 1
-    CHECK(!decodeFrame(old));
+    // No GOP start: two bytes of header.
+    h.gopStart = NO_GOP_START;
+    h.codec = Codec::Vvc;
+    h.last = false;
+    Bytes plain = encodeFrame(h, payload.data(), payload.size());
+    CHECK_EQ(plain.size(), (size_t)144);
+    d = decodeFrame(plain);
+    CHECK(d && d->header.codec == Codec::Vvc && d->header.gopStart == NO_GOP_START && !d->header.last);
+    CHECK(d->payload == payload);
+
+    Bytes none = f;
+    none[0] &= 0x3F;  // no codec
+    CHECK(!decodeFrame(none));
     Bytes far = f;
-    far[3] = 141;  // GOP start past the payload
+    far[2] = 142;  // GOP start past the payload
     CHECK(!decodeFrame(far));
-    CHECK(!decodeFrame(Bytes{0x21, 0, 0, 0xff}));  // no payload
+    CHECK(!decodeFrame(Bytes{0x60, 0}));         // no payload
+    CHECK(!decodeFrame(Bytes{0x60 | 0x20, 0, 0}));  // GOP start, no payload
 }
 
 void delimitersGo()
@@ -98,22 +119,33 @@ void delimitersGo()
     std::mt19937 rng(1);
     Bytes key = picture(rng, 300, true);
     Bytes air = toAir(Codec::Av1, key);
-    CHECK_EQ(air.size(), key.size() - 2);
-    CHECK(Bytes(key.begin() + 2, key.end()) == air);
+    // [8 << 3 | sequence header << 1 | more][8 B][300 << 3 | frame << 1][300 B]
+    CHECK_EQ(air.size(), (size_t)(1 + 8 + 2 + 300));
+    CHECK_EQ(air[0], (uint8_t)(8 << 3 | 2 << 1 | 1));
     CHECK(fromAir(Codec::Av1, air) == key);
     Bytes p = picture(rng, 20, false);
     obu(p, 15, Bytes(9, 0));  // padding goes too
-    CHECK_EQ(toAir(Codec::Av1, p).size(), (size_t)(1 + 1 + 20));
+    CHECK_EQ(toAir(Codec::Av1, p).size(), (size_t)(2 + 20));
+    // a small frame header, a byte less than the OBU
+    Bytes show{0x12, 0x00};
+    obu(show, 3, Bytes{0x9a});
+    CHECK_EQ(toAir(Codec::Av1, show).size(), (size_t)2);
+    CHECK(fromAir(Codec::Av1, toAir(Codec::Av1, show)) == show);
+    // anything else keeps its OBU header (metadata, with an extension)
+    Bytes meta{0x12, 0x00, (uint8_t)(5 << 3 | 0x04 | 0x02), 0x28, 0x02, 0x01, 0x02};
+    CHECK_EQ(toAir(Codec::Av1, meta).size(), (size_t)(1 + 2 + 2));
+    CHECK(fromAir(Codec::Av1, toAir(Codec::Av1, meta)) == meta);
     Bytes junk{0x80, 1, 2};
-    CHECK(toAir(Codec::Av1, junk) == junk);  // not OBUs: left as it is
+    CHECK(toAir(Codec::Av1, junk).empty());  // not OBUs: nothing to send
 }
 
 // VVC: start codes become sizes, SEI and delimiters go.
 void vvcUnits()
 {
     auto nal = [](int type, size_t len, uint8_t fill) {
-        Bytes n{0x00, (uint8_t)(type << 3 | 1)};
-        n.resize(len, fill);
+        Bytes n(len, fill);
+        n[0] = 0x00;
+        n[1] = (uint8_t)(type << 3 | 1);
         return n;
     };
     Bytes sps = nal(15, 20, 0x11), pps = nal(16, 8, 0x22), sei = nal(23, 30, 0x33), aud = nal(20, 3, 0x44),
@@ -126,7 +158,9 @@ void vvcUnits()
         au.insert(au.end(), n->begin(), n->end());
     }
     Bytes air = toAir(Codec::Vvc, au);
-    CHECK_EQ(air.size(), (size_t)(1 + 20 + 1 + 8 + 2 + 300));
+    // each [length << 1 | more][the NAL less its first byte]
+    CHECK_EQ(air.size(), (size_t)(1 + 19 + 1 + 7 + 2 + 299));
+    CHECK_EQ(air[0], (uint8_t)(19 << 1 | 1));
     Bytes back = fromAir(Codec::Vvc, air);
     Bytes want;
     for (const Bytes* n : {&sps, &pps, &slice})
@@ -135,6 +169,15 @@ void vvcUnits()
         want.insert(want.end(), n->begin(), n->end());
     }
     CHECK(back == want);
+
+    // SPS and PPS are the parameters; without them only the slice goes.
+    CHECK_EQ(paramsOf(Codec::Vvc, au).size(), (size_t)(4 + 20 + 4 + 8));
+    CHECK_EQ(toAir(Codec::Vvc, withoutParams(Codec::Vvc, au)).size(), (size_t)(2 + 299));
+
+    // Two layers can't go: the first byte isn't 0.
+    Bytes layered = au;
+    layered[4 + 3 + 4] = 0x01;  // the SPS's layer
+    CHECK(toAir(Codec::Vvc, layered).empty());
 
     // A VVC burst goes and comes back the same way.
     Gop g;
@@ -148,7 +191,9 @@ void vvcUnits()
     for (auto& f : *frames) got.push_back(decodeFrame(f));
     auto r = parseBurst(got);
     CHECK_EQ(r.size(), (size_t)1);
-    CHECK(r[0].codec == Codec::Vvc && r[0].complete && r[0].units.size() == 2 && r[0].units[1] == want);
+    // the second unit's SPS and PPS repeat the first's: they don't go
+    CHECK(r[0].codec == Codec::Vvc && r[0].complete && r[0].units.size() == 2);
+    CHECK(r[0].units[0] == want && r[0].units[1] == withoutParams(Codec::Vvc, want));
 }
 
 void wholeBurst()
@@ -174,12 +219,14 @@ void wholeBurst()
         CHECK(got[g].complete);
         CHECK_EQ(got[g].header.first, (uint8_t)(g * 15));
         CHECK_EQ(got[g].header.burstPictures, (uint8_t)60);
-        CHECK(got[g].header.osd == "N0CALL");
+        CHECK(got[g].header.osd == gops[g].header.osd);
         CHECK(got[g].units == gops[g].units);  // the delimiter is back
         CHECK(got[g].codec == Codec::Av1);
     }
-    CHECK(bytes < 141 * 78);
-    CHECK(!packBurst(9, Codec::Av1, gops, 141, (int)(bytes / 141)));  // one frame short
+    CHECK(bytes <= burstCapacity(141, 78, 4));
+    CHECK(!packBurst(9, Codec::Av1, gops, 141, (int)(bytes / 141)));  // a frame short
+    // the capacity is what it says: GOPs filling it to the byte still go
+    CHECK(packBurst(9, Codec::Av1, gops, 141, (int)((bytes + 4 + 140) / 141)).has_value());
 }
 
 // Lost frames: the GOP they cut ends there, the next GOP the frames point
@@ -201,8 +248,8 @@ void lostFrames()
     const size_t end = at;
 
     // Inside GOP 1, past its keyframe, no GOP starting in that frame.
-    int inside = frameAt(start[2], P) - 1;
-    CHECK(inside > frameAt(start[1], P) + 5);
+    int inside = frameAt(*frames, start[2]) - 1;
+    CHECK(inside > frameAt(*frames, start[1]) + 5);
     auto got = parseBurst(receive(*frames, {inside}));
     CHECK_EQ(got.size(), (size_t)4);
     CHECK(got[0].complete && got[2].complete && got[3].complete);
@@ -216,19 +263,19 @@ void lostFrames()
     CHECK(got[0].header.first == 15 && got[0].complete);
 
     // The frame where GOP 2 starts: GOP 1 loses its end, GOP 2 is gone.
-    got = parseBurst(receive(*frames, {frameAt(start[2], P)}));
+    got = parseBurst(receive(*frames, {frameAt(*frames, start[2])}));
     CHECK_EQ(got.size(), (size_t)3);
     CHECK(got[0].complete && !got[1].complete && got[2].header.first == 45 && got[2].complete);
 
     // Only the padding lost: nothing missed.
     got = parseBurst(receive(*frames, {77, 76}));
-    CHECK(frameAt(end, P) < 76);
+    CHECK(frameAt(*frames, end) < 76);
     CHECK_EQ(got.size(), (size_t)4);
     for (auto& g : got) CHECK(g.complete);
 
     // A fade over most of the burst: whatever GOP starts after it.
     std::vector<int> fade;
-    for (int i = 0; i <= frameAt(start[3], P) - 1; i++) fade.push_back(i);
+    for (int i = 0; i <= frameAt(*frames, start[3]) - 1; i++) fade.push_back(i);
     got = parseBurst(receive(*frames, fade));
     CHECK_EQ(got.size(), (size_t)1);
     CHECK(got[0].header.first == 45 && got[0].complete);
@@ -261,6 +308,54 @@ void smallGops()
     for (auto& g : got) CHECK(g.complete);
 }
 
+// The sequence header only with the burst's first GOP: the others get it
+// back from it, or from the burst before when the first GOP is lost, and
+// nothing repeats it within a GOP.
+void paramsOnce()
+{
+    std::mt19937 rng(5);
+    auto gops = someGops(rng, 4, 15);
+    // libaom sends the sequence header again later in a GOP: it goes
+    obu(gops[2].units[5], 1, Bytes{0x00, 0x00, 0x00, 0x0a, 0x0b, 0xf0, 0x80, 0x00});
+    const Bytes seq = paramsOf(Codec::Av1, gops[0].units[0]);
+    CHECK_EQ(seq.size(), (size_t)10);
+    CHECK(paramsOf(Codec::Av1, gops[0].units[1]).empty());
+    CHECK(withParams(Codec::Av1, withoutParams(Codec::Av1, gops[0].units[0]), seq) == gops[0].units[0]);
+
+    size_t all = 0, once = 0;
+    for (size_t g = 0; g < gops.size(); g++)
+    {
+        all += gopBytes(Codec::Av1, gops[g].header, gops[g].units);
+        once += gopBytes(Codec::Av1, gops[g].header, gops[g].units, g == 0);
+        gops[g].params = g == 0;
+    }
+    CHECK_EQ(all - once, (size_t)(3 * 9));  // three GOPs' headers (9 B on the air)
+    size_t raw = 5;  // GOP 2's header (no OSD) and units as they are, less delimiters
+    for (const Bytes& u : gops[2].units) raw += toAir(Codec::Av1, u).size();
+    CHECK_EQ(raw - gopBytes(Codec::Av1, gops[2].header, gops[2].units), (size_t)9);  // the repeat
+
+    auto frames = packBurst(3, Codec::Av1, gops, 141, 78);
+    CHECK(frames.has_value());
+    auto want = [&](size_t g, size_t u) {
+        Bytes x = gops[g].units[u];
+        return g == 2 && u == 5 ? withoutParams(Codec::Av1, x) : x;
+    };
+    ParamCache cache;
+    auto got = parseBurst(receive(*frames), &cache);
+    CHECK_EQ(got.size(), (size_t)4);
+    for (size_t g = 0; g < got.size(); g++)
+        for (size_t u = 0; u < got[g].units.size(); u++) CHECK(got[g].units[u] == want(g, u));
+    CHECK(cache.av1 == seq);
+
+    // GOP 0 lost: the next burst's GOPs take the header from the cache...
+    got = parseBurst(receive(*frames, {0}), &cache);
+    CHECK_EQ(got.size(), (size_t)3);
+    CHECK(got[0].header.first == 15 && got[0].units[0] == gops[1].units[0]);
+    // ...and without one, they come as they are (no header: no picture)
+    got = parseBurst(receive(*frames, {0}));
+    CHECK(got[0].units[0] == withoutParams(Codec::Av1, gops[1].units[0]));
+}
+
 } // namespace
 
 int main()
@@ -271,5 +366,6 @@ int main()
     wholeBurst();
     lostFrames();
     smallGops();
+    paramsOnce();
     return ragtime_test::finish();
 }

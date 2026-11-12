@@ -30,7 +30,7 @@ Status: plan approved 2026-11-11, M0 and M1 done.
   data2g-host (M0, below).
 - **Polish rules.** No CW ID and no band plan segments are required, so
   FennecTV adds neither. ID stays possible through the burst's group+from
-  TLV (`BCAST OPEN FENNECTV FROM call`), which costs nothing.
+  TLV (`BCAST OPEN FENNECTV4 FROM call`), which costs nothing.
 
 ## Why Qt 6 rather than wxWidgets
 
@@ -55,7 +55,8 @@ Read from Data2G's `docs/broadcast.md`, `data2g/kisslink.py`,
    Ports opened by a client close when that client goes. Statuses go to
    the command clients that sent a BCAST command.
 2. **Group name.** Up to 10 characters from A-Z 0-9 / - and space, and
-   never a valid callsign. `FENNECTV` (8, no digit) fits.
+   never a valid callsign. `FENNECTV4` (9, no letter after the digit) fits;
+   its last digit is the protocol version.
 3. **How a burst is built** (`KissLink.next_burst`). It takes the first
    queued frame's port and mode, then every queued frame of that port
    that fits, in queue order, within the port's size class. A port in
@@ -94,6 +95,8 @@ back bursts (PTT delays are 100 + 50 ms by default).
 ```
 fennectv/
   CMakeLists.txt        C++17; FFmpeg via pkg-config; Qt 6 (Core, Network, Widgets)
+  VERSION               the version, one line: CMake, the packages and releases read it
+  CHANGELOG.md          a section a version: the GitHub release notes
   LICENSE               GPL-3.0
   vendor/
     README.md           where each folder came from, the commit, its licence, what changed
@@ -101,16 +104,21 @@ fennectv/
                         LICENSE (MIT); ragtime 6b898d9
   core/                 libfennectv: no Qt, no FFmpeg, all unit tested
     protocol/           frame header, GOPs in a burst, the receiver's parser
-    budget/             burst capacity from MODES: frames, their size
-    sim/                loss models (iid, Gilbert-Elliott fading)
-  codec/                AV1 (libaom) and VVC (VVenC, VVdeC): encoders fit to a burst, decoders
+    budget/             burst capacity from MODES, the best mix of GOP codings
+  codec/                VVC (VVenC, VVdeC) and AV1 (libaom): encoders fit to a burst, decoders
   media/                FFmpeg: sources, scaling, frame rate, pixel format
   link/                 Qt: data2g-host command and KISS clients (BCAST OPEN/MODE, ACKMODE)
   apps/tx, apps/rx      CLI: fennectv-tx, fennectv-rx
-  gui/                  fennectv (M5)
+  gui/                  fennectv (M4)
   tests/
-  packaging/            PKGBUILD (beside arch/ragtime-git), Windows zip script
-  docs/PLAN.md, docs/PROTOCOL.md
+  packaging/
+    windows/            the zip: Docker, quasi-msys2 (MSYS2 UCRT64 libraries), Clang
+    appimage/           the AppImage: Docker, Ubuntu 24.04, linuxdeploy
+    linux/              .desktop entry and icon (installed by CMake)
+    release             tests, both packages, source, SHA256SUMS; --publish to GitHub
+  docs/PLAN.md          this
+  docs/BUILD.md         building, the tests, the manual checks before a release
+  docs/RELEASING.md     how to make a release
 ```
 
 Ragtime's `HostLink` is left out: most of it is sessions. FennecTV needs
@@ -118,38 +126,63 @@ only the broadcast commands, a small class of its own in `link/`.
 
 ## On the air
 
-Frames go to the KISS port of group `FENNECTV`, opened with
-`BCAST OPEN FENNECTV FROM <call>` and `BCAST MODE n <mode>` (never AUTO).
+Frames go to the KISS port of group `FENNECTV4`, opened with
+`BCAST OPEN FENNECTV4 FROM <call>` and `BCAST MODE n <mode>` (never AUTO).
+The group's last digit is the protocol version: Data2G sends the name in
+the control codeword anyway and masks every CRC with it, so a receiver
+of another version never even gets the frames, and no byte of the burst
+says it.
 
-**Each KISS frame** has a 4-byte header:
+Every byte counts: at 7 kbps a byte a frame is 1% of the picture.
+**Each KISS frame** has a 2-byte header, 3 where a GOP starts:
 
 ```
-[version 4 bits | codec 4][burst 1][idx 7 bits | last 1][GOP start 1][payload]
+[codec 2 bits | start 1 | burst 5][last 1 | idx 7]([GOP start 1])[payload]
 ```
 
-- `burst` numbers the bursts (wraps), `idx` the frame in it, `last`
-  marks the burst's last frame so a receiver needn't wait for quiet.
-- `GOP start`: where in this payload the first GOP header begins, 0xFF
-  for none. After a lost frame the receiver picks up there.
-- Payload: 229 B a frame on Q3k (19 frames, 4351 B a burst), 141 B on
-  Z8k (78 frames, 10998 B).
+- `codec` 1 AV1, 3 VVC. `burst` numbers the bursts mod 32, `idx` the
+  frame in it, `last` marks the burst's last frame so a receiver needn't
+  wait for quiet.
+- `start`: a GOP begins in this frame, and the `GOP start` byte says
+  where in the payload (the first one). After a lost frame the receiver
+  picks up there.
+- Frames are all the mode's length: the payload is 231 B a frame on Q3k
+  (19 frames), 143 B on Z8k (78 frames), a byte less where a GOP starts:
+  4385 and 11150 B a burst with 4 GOPs.
 
 **The burst** (the payloads end to end):
 
 ```
-GOP:  [0x80][fps][first picture][units][burst pictures][OSD length][OSD]
-      units x [size, LEB128][unit], decode order, one a picture:
-        AV1: the temporal unit's OBUs, no temporal delimiter
-        VVC: [size, LEB128][NAL unit]..., no start codes, SEI or AUD
+GOP:  [units][first picture][fps][burst pictures][OSD length][OSD]
+      units x unit, decode order, one a picture, each ending itself:
+        AV1: [payload length << 3 | kind << 1 | more, LEB128]([OBU
+             header])[payload]... for the temporal unit's OBUs but the
+             delimiter: kind frame, frame header or sequence header (the
+             OBU header implied), or other (it follows); more clear on
+             the last
+        VVC: [length << 1 | more, LEB128][NAL unit less its first byte]...,
+             more clear on the last; no start codes, SEI or AUD
 ...   more GOPs
 [zeros to the end]
 ```
 
-- Protocol version 3 (2026-11-12). The codec is in every frame header.
-- Every GOP starts with a random access point: an AV1 key frame with the
-  sequence header, a VVC IDR with SPS and PPS. Width, height and colour
-  come from those. No frame table, no CRC: the sizes delimit the units
-  and Data2G checks every codeword.
+- Protocol version 4 (2026-11-12). The codec is in every frame header.
+- `units` is never 0, so a zero after a GOP is the padding. The OSD goes
+  in the burst's first GOP only; the receiver keeps the last one.
+- The first byte of a VVC NAL unit (forbidden and reserved bits, layer
+  id) is 0 in one layer, which is all VVenC codes; the receiver puts it
+  back, and AV1's OBU headers and sizes, before decoding. Neither form
+  is ever longer than the codec's own, and often a byte a unit shorter.
+- The sequence's parameters (AV1 sequence header, VVC SPS and PPS; 12
+  and ~150 B) go in the burst's first GOP only, and never twice in a
+  GOP: they don't change while the transmission lasts. The receiver
+  keeps the last ones; a GOP that came without them gets those. Only a
+  receiver that has just started and lost the burst's first GOP waits a
+  burst for a picture.
+- Every GOP starts with a random access point: an AV1 key frame, a VVC
+  IDR; with the sequence's parameters (below) a decoder starts there.
+  Width, height and colour come from those. No frame table, no CRC, no unit sizes: the units end
+  themselves and Data2G checks every codeword.
 - With B frames units are in decode order; the decoder gives pictures
   back with their display order, and the receiver puts each in its place.
 - **A lost frame** ends the GOP it falls in: its pictures up to the hole
@@ -170,25 +203,37 @@ GOP:  [0x80][fps][first picture][units][burst pictures][OSD length][OSD]
    measured from `PTT ON/OFF`), so the stream keeps up with real time.
 4. **Encoder** (`--codec`), straight through its library, one encoder a
    codec on purpose (decoders agree, encoders don't), each GOP on its own:
-   - AV1, libaom: good quality, cpu-used 0, two-pass, monochrome for gray;
+   - VVC, VVenC (the default): preset slow, no perceptual QP adaptation,
+     two-pass rate control, 10 bits inside, gray or 4:2:0 only (VVenC
+     codes nothing else); B frames as random access with a closed GOP
+     (IDR first, hierarchical groups of 16). No HRD and no VUI in the
+     SPS, a fixed level: the SPS is the same whatever the bit rate, so it
+     can go once a burst.
+   - AV1, libaom: good quality, cpu-used 2, a constant quantizer (cq-level)
+     found per GOP instead of libaom's rate control, monochrome for gray;
      B frames as alt-refs (lag over the GOP).
-   - VVC, VVenC: preset slower, two-pass rate control, 10 bits inside,
-     gray or 4:2:0 only (VVenC codes nothing else); B frames as random
-     access with a closed GOP (IDR first, hierarchical groups of 16).
+   - `--preset` and `--param KEY=VALUE` reach either library directly.
    - `--b-frames off`: forward references only (AV1 no alt-ref, VVC low
      delay).
    The burst's GOPs are coded side by side on `--jobs` threads.
-5. **Rate fit:** each GOP gets the burst's room by its share of pictures
-   and is coded again until it lands within `--fill` (95%) less
-   `--tolerance`. One that can't fit gets what the others left, then
-   loses its last pictures.
+5. **Rate fit, no coding thrown away:** each GOP gets the burst's room
+   by its share of pictures and is coded again (up to `--tries`) until
+   it lands within `--fill` (100%) less `--tolerance` (4%). The first
+   try is aimed by what that GOP's place in the bursts before learned
+   (bytes made for bytes asked), the next ones by a secant through the
+   tries so far. Every try is kept: the burst is then made of the mix
+   of the GOPs' codings that fills it best (`bestFill`), so one GOP's
+   too big a try takes the room another left. A GOP that still can't
+   fit gets what the others left, then loses its last pictures.
+   Measured: bursts 95.5% full before, 99.6% after, and faster (fewer
+   tries).
 6. **Pack, queue:** burst N+1 is queued when `PTT ON` says burst N has
    started, so bursts run back to back. ACKMODE tags confirm each burst
    went out.
 
 ## Receiving
 
-KISS client and `BCAST OPEN FENNECTV`. Frames are collected by burst
+KISS client and `BCAST OPEN FENNECTV4`. Frames are collected by burst
 number; a burst is done at its last frame, a new burst number, or a
 second of quiet. libaom or VVdeC decodes every GOP that arrived, each
 from its keyframe, as far as its units go. Playback keeps the stream's pace a burst behind (3 s preroll):
@@ -203,11 +248,28 @@ can be recorded locally (`.ivf` or `.mkv`).
 
 | Mode | Picture (defaults) | Burst |
 |---|---|---|
-| Z8k `w48-256l-r5/8` | 160×120 gray, 5 fps, GOP 3 s | 10998 B / 12.3 s, 7.2 kbps |
-| Q3k `w48-16qam-r1/2` | 96×72 gray, 3 fps, GOP 3 s | 4351 B / 12.3 s, 2.8 kbps |
+| Z8k `w48-256l-r5/8` | 160×120 gray, 5 fps, GOP 3 s | 11150 B / 12.3 s, 7.3 kbps |
+| Q3k `w48-16qam-r1/2` | 96×72 gray, 3 fps, GOP 3 s | 4385 B / 12.3 s, 2.9 kbps |
 
-Measured 2026-11-12 on the test film: Z8k bursts 94-98% full, 61/61
-pictures, coded in 5-10 s; Q3k 97-100%, 37/37, 2-5 s. Q3k at 128×96
+Measured 2026-11-12 on the test film, protocol 4, the transmitter's own
+path (bursts of 4 GOPs, decoded back, 6 bursts from 3 places; PSNR and
+SSIM of the gray picture, full range):
+
+| | Z8k | Q3k | time a burst (Z8k) |
+|---|---|---|---|
+| VVC slow, no QPA, B (default) | 28.86 dB, 0.904 | 26.4-27.3, 0.903 | 6 s |
+| VVC slower | 28.94, 0.904 | 27.56, 0.908 | 23 s |
+| VVC medium | 28.66, 0.900 | 27.32, 0.903 | 2.5 s |
+| VVC low delay (no B) | 28.59, 0.897 | 26.57, 0.885 | 6 s |
+| AV1 cpu-used 2, cq, B | 27.81, 0.882 | 26.10, 0.875 | 3 s |
+| AV1 no B | 26.91, 0.856 | 25.46, 0.855 | 3 s |
+| AV1 two-pass VBR (before) | 25.57, 0.823 | 24.31, 0.820 | 8 s |
+
+Bursts 98-100% full, 61/61 and 37/37 pictures. VVenC's perceptual QP
+adaptation cost 0.9 dB (and SSIM) at these sizes; libaom's cpu-used 0
+gains nothing over 2. Protocol 4 against 3: 152 B more a Z8k burst from
+the frame headers, ~400 B from VVC's SPS going once a burst (and 22 B
+less of it), ~30 B from AV1's OBU headers, 18 B of OSD. Q3k at 128×96
 needs `--gop 6`. GOPs of 1 s don't work at these rates: the keyframes
 alone take 85% of a Z8k burst.
 
@@ -218,11 +280,42 @@ kbps. An AV1 keyframe is ~850 B.
 
 ## Builds
 
-- **Arch:** `pacman -S cmake ninja qt6-base ffmpeg`. A `fennectv-git`
-  PKGBUILD beside `arch/ragtime-git` and `aur/`.
-- **Windows (MSYS2 UCRT64):** `pacman -S mingw-w64-ucrt-x86_64-{toolchain,cmake,ninja,qt6-base,ffmpeg}`.
-  The zip is made with `windeployqt` plus the FFmpeg DLLs found with
-  `ldd`.
+The version is `VERSION`; `fennectv-tx --version` prints it with the
+broadcast group (the protocol).
+
+- **Development (Arch):** `pacman -S cmake ninja qt6-base ffmpeg aom`,
+  VVenC and VVdeC from the AUR. `ctest -L unit` for the unit tests,
+  `ctest -L media` for the media test (the test film beside the checkout,
+  minutes).
+- **Windows zip** (`packaging/windows/build`): cross-compiled from Linux
+  in Docker, nothing on the host. quasi-msys2 unpacks MSYS2's UCRT64
+  packages (Qt 6, FFmpeg, libaom) and the native Clang builds against
+  them; VVenC and VVdeC are built in the image, static. The zip holds the
+  programs, Qt's Windows platform and style plugins, and every DLL they
+  load from the MSYS2 tree (found with `llvm-objdump`). A UTF-8 manifest
+  for file names. Size doesn't matter: ~100 MB, most of it FFmpeg's
+  dependencies. Starts under Wine (checked 2026-11-12).
+- **Linux AppImage** (`packaging/appimage/build`): in Docker on Ubuntu
+  24.04, so it runs on glibc 2.39 and newer; Ubuntu's Qt 6 and libaom,
+  FFmpeg 7.1, VVenC and VVdeC built in the image, linuxdeploy and its Qt
+  plugin bundle the rest (xcb and Wayland platforms). FFmpeg is our own
+  because Ubuntu's pulls in X11, GL, ALSA, JACK, libusb, which an
+  AppImage leaves to the system: ours has FFmpeg's native demuxers,
+  decoders, filters and protocols, v4l2 and dav1d, nothing autodetected.
+  So fennectv-tx needs nothing but glibc and zlib (a server will do);
+  fennectv-rx --play needs what every desktop has (EGL/GL, X11 or
+  Wayland, fontconfig, HarfBuzz). 51 MB. One AppImage, two programs:
+  `FennecTV.AppImage tx|rx ...`, or linked as `fennectv-tx` and
+  `fennectv-rx`. Checked 2026-11-12 on bare Debian 13, Fedora 41 and
+  Ubuntu 24.04 (fennectv-tx, both encoders) and on Debian 13 with Xvfb
+  (fennectv-rx --play).
+- **Release** (`packaging/release`): the unit tests on the host, both
+  packages, `git archive` of the commit and `SHA256SUMS` into
+  `dist/release/<version>/`; `--publish` tags `v<version>`, pushes the
+  tag and makes the GitHub release with `gh`, the notes from
+  `CHANGELOG.md`. It refuses uncommitted changes, an existing tag, a
+  commit not on GitHub, a version without a changelog section.
+- Later: a `fennectv-git` PKGBUILD beside `arch/ragtime-git`.
 
 ## Milestones
 
@@ -241,7 +334,8 @@ kbps. An AV1 keyframe is ~850 B.
   Done when 10 minutes stream with no gaps between bursts, about two
   burst periods glass to glass. Burst gap measured.
 - **M6, on the air.** Q3k and Z8k on a real band.
-- **Packaging.** PKGBUILD and the Windows zip, once M5 passes.
+- **Packaging.** Windows zip, AppImage and the release script done
+  2026-11-12; a PKGBUILD once M5 passes.
 
 ## Testing without a radio
 

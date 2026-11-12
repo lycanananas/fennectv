@@ -26,7 +26,7 @@ cmake --build "$build"
 
 # The MSYS2 tree, as a Linux path.
 prefix="$MSYSTEM_PREFIX"
-version=$(sed -n 's/^project(FennecTV VERSION \([0-9.]*\).*/\1/p' "$src/CMakeLists.txt")
+version=$(tr -d " \t\r\n" <"$src/VERSION")
 name="fennectv-$version-win64"
 out="$dist/$name"
 rm -rf "$out" "$out.zip"

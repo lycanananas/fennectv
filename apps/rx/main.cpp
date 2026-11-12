@@ -1,4 +1,4 @@
-// fennectv-rx: listens to a data2g-host's FENNECTV group, puts each
+// fennectv-rx: listens to a data2g-host's FENNECTV4 group (protocol 4), puts each
 // burst's frames together, decodes every GOP whose keyframe arrived (AV1
 // with libaom, VVC with VVdeC), as far as its bytes go, and shows it (--play) at the stream's
 // pace, holding the last picture over what was lost; or writes the stream
@@ -38,6 +38,7 @@ const char* USAGE = R"(fennectv-rx [options]
   --kiss PORT        its KISS port (default 8100)
   --play             show the picture in a window
   --out FILE         write the stream; - for stdout
+  --version          the version and the broadcast group (the protocol)
 )";
 
 using Clock = std::chrono::steady_clock;
@@ -100,7 +101,7 @@ protected:
         else
         {
             p.setPen(Qt::gray);
-            p.drawText(area, Qt::AlignCenter, "waiting for FENNECTV...");
+            p.drawText(area, Qt::AlignCenter, "waiting for FENNECTV4...");
         }
         p.setPen(QColor(200, 200, 200));
         p.drawText(QRect(8, height() - bar, width() - 16, bar), Qt::AlignVCenter | Qt::AlignLeft, status_);
@@ -229,7 +230,7 @@ private:
         if (b.total > (int)b.frames.size()) b.frames.resize((size_t)b.total);
         int kept = 0;
         for (auto& f : b.frames) kept += f.has_value();
-        std::vector<ReceivedGop> gops = parseBurst(b.frames);
+        std::vector<ReceivedGop> gops = parseBurst(b.frames, &params_);
 
         // The burst's pictures in their places; what didn't come stays empty.
         int total = 0;
@@ -241,7 +242,8 @@ private:
         for (const ReceivedGop& g : gops)
         {
             if (g.header.fps) fps_ = g.header.fps;
-            if (screen_) screen_->setOsd(QString::fromStdString(g.header.osd));
+            // the burst's first GOP brings it; the others keep it
+            if (screen_ && !g.header.osd.empty()) screen_->setOsd(QString::fromStdString(g.header.osd));
             whole = whole && g.complete;
             Decoder* dec = decoderFor(g.codec);
             int decoded = 0;
@@ -311,6 +313,7 @@ private:
     std::map<uint8_t, Burst> bursts_;
     std::optional<double> lastSnr_;
     std::map<Codec, std::unique_ptr<Decoder>> decoders_;
+    ParamCache params_;  // the sequence's parameters: once a burst, kept for GOPs without them
 
     Decoder* decoderFor(Codec c)
     {
@@ -337,14 +340,25 @@ private:
 
 int main(int argc, char** argv)
 {
-    QApplication app(argc, argv);
-    Args a(argc, argv, {"play", "help"});
+    Args a(argc, argv, {"play", "help", "version"});
+    if (a.has("version"))
+    {
+        std::printf("fennectv-rx %s, broadcast group %s\n", FENNECTV_VERSION, GROUP);
+        return 0;
+    }
     if (!a.bad().empty() || a.has("help"))
     {
         if (!a.bad().empty()) std::fprintf(stderr, "%s\n\n", a.bad().c_str());
         std::fputs(USAGE, a.has("help") ? stdout : stderr);
         return a.has("help") ? 0 : 2;
     }
+    // A window only for --play: without it no display is needed (a server
+    // receiving to --out).
+    std::unique_ptr<QCoreApplication> app;
+    if (a.has("play"))
+        app = std::make_unique<QApplication>(argc, argv);
+    else
+        app = std::make_unique<QCoreApplication>(argc, argv);
 
     HostClient host;
     if (!host.connectTo(a.str("host", "127.0.0.1"), a.integer("cmd", 8300), a.integer("kiss", 8100)))
@@ -388,7 +402,7 @@ int main(int argc, char** argv)
         if (!rx.pump())
         {
             std::fprintf(stderr, "data2g-host went away\n");
-            app.quit();
+            app->quit();
         }
     });
     net.start(50);
@@ -399,7 +413,7 @@ int main(int argc, char** argv)
         if (frames.interval() != ms) frames.setInterval(ms);
     });
     frames.start(100);
-    int r = app.exec();
+    int r = app->exec();
     rx.summary();
     if (out && out != stdout) std::fclose(out);
     return r;

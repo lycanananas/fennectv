@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
-project(FennecTV VERSION 0.0.1 LANGUAGES CXX)
+# The version lives in VERSION, one line (packaging and releases read it too).
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" FENNECTV_VERSION LIMIT_COUNT 1)
+string(STRIP "${FENNECTV_VERSION}" FENNECTV_VERSION)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
+project(FennecTV VERSION ${FENNECTV_VERSION} LANGUAGES CXX)
+
+include(GNUInstallDirs)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -71,6 +77,13 @@ if(FENNECTV_BUILD_APPS)
     add_executable(fennectv-rx apps/rx/main.cpp ${_win_resources})
     target_link_libraries(fennectv-rx PRIVATE fennectv_link fennectv_codec Qt6::Widgets)
     fennectv_warnings(fennectv-rx)
+
+    foreach(app fennectv-tx fennectv-rx)
+        target_compile_definitions(${app} PRIVATE FENNECTV_VERSION="${PROJECT_VERSION}")
+    endforeach()
+    install(TARGETS fennectv-tx fennectv-rx RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(FILES packaging/linux/fennectv.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+    install(FILES packaging/linux/fennectv.svg DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
 endif()
 
 if(FENNECTV_BUILD_TESTS)

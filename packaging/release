@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# A FennecTV release, version from VERSION, notes from CHANGELOG.md:
+#
+#   packaging/release --check      only the checks a release needs (seconds)
+#   packaging/release              build it into dist/release/<version>/
+#   packaging/release --publish    ...then tag v<version>, push the tag and
+#                                  make the GitHub release (gh) with the files
+#
+# What it builds: the tests (on this machine, as for development), the
+# Windows zip and the Linux AppImage (both in Docker), a source tarball of
+# the commit, and SHA256SUMS. --publish uses that build if it was made
+# from this very commit, clean; else it builds again first.
+#
+# The notes are VERSION's section of CHANGELOG.md, with the downloads, how
+# to check them, and how to run them (packaging/release-notes/how-to-run.md)
+# added. The section's heading may carry a name:
+#   ## 0.1.0 - First public beta
+# makes the release "FennecTV 0.1.0 - First public beta". A name or
+# version with alpha, beta or rc in it makes a pre-release on GitHub.
+#
+# Options:
+#   --check          the checks only, nothing built
+#   --publish        tag, push the tag, create the release
+#   --draft          with --publish: a draft, published by hand on GitHub
+#   --prerelease     a pre-release even without alpha/beta/rc in the name
+#   --no-tests       skip the tests
+#   --media          also the media test (minutes; needs the test film)
+#   --no-windows     skip the Windows zip
+#   --no-linux       skip the AppImage
+#   --allow-dirty    build from uncommitted changes (never with --publish;
+#                    the source tarball is the commit regardless)
+#
+# How to: docs/RELEASING.md.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(cd "$here/.." && pwd)
+cd "$repo"
+
+check=0 publish=0 draft=0 pre=0 tests=1 media=0 windows=1 linux=1 dirty=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check) check=1 ;;
+        --publish) publish=1 ;;
+        --draft) draft=1 ;;
+        --prerelease) pre=1 ;;
+        --no-tests) tests=0 ;;
+        --media) media=1 ;;
+        --no-windows) windows=0 ;;
+        --no-linux) linux=0 ;;
+        --allow-dirty) dirty=1 ;;
+        -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown option: $1 (--help)" >&2; exit 2 ;;
+    esac
+    shift
+done
+[[ $draft == 1 && $publish == 0 ]] && { echo "release: --draft goes with --publish" >&2; exit 2; }
+
+problems=0
+die() { echo "release: $*" >&2; exit 1; }
+problem() { echo "  ✗ $*" >&2; problems=$((problems + 1)); }
+fine() { echo "  ✓ $*"; }
+step() { echo; echo "== $*"; }
+
+version=$(tr -d " \t\r\n" <VERSION)
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || die "VERSION isn't a version: '$version'"
+tag="v$version"
+out="dist/release/$version"
+head=$(git rev-parse HEAD)
+
+# The section: from "## <version>[ - name]" to the next "## ".
+heading=$(awk -v v="$version" '/^## / && ($2 == v || $2 == "[" v "]") { print; exit }' CHANGELOG.md)
+notes=$(awk -v v="$version" '
+    /^## / { if (on) exit; on = ($2 == v || $2 == "[" v "]"); next }
+    on' CHANGELOG.md)
+# The name after the version, without the dash or colon before it.
+name=$(sed -E 's/^## +\[?[^] ]+\]? *//; s/^[-–—:] *//' <<<"$heading")
+title="FennecTV $version${name:+ - $name}"
+if [[ $pre == 0 ]] && grep -qiE '(alpha|beta|rc)' <<<"$version $name"; then pre=1; fi
+
+# --- The checks, before minutes of building --------------------------------
+step "checks for $title"
+[[ -n "$heading" && -n "${notes//[[:space:]]/}" ]] && fine "CHANGELOG.md has '## $version'" \
+    || problem "CHANGELOG.md has no section '## $version' (or it's empty)"
+if [[ -z "$(git status --porcelain)" ]]; then
+    fine "nothing uncommitted"
+elif [[ $dirty == 1 && $publish == 0 && $check == 0 ]]; then
+    echo "  ! uncommitted changes: a trial build, not publishable"
+else
+    problem "uncommitted changes: commit them first (or --allow-dirty for a trial build)"
+fi
+if [[ $publish == 1 || $check == 1 ]]; then
+    if command -v gh >/dev/null; then
+        gh auth status >/dev/null 2>&1 && fine "gh logged in" || problem "gh isn't logged in: gh auth login"
+    else
+        problem "no gh (GitHub CLI): sudo pacman -S github-cli"
+    fi
+    if git fetch --quiet --tags origin 2>/dev/null; then
+        git rev-parse -q --verify "refs/tags/$tag" >/dev/null \
+            && problem "tag $tag exists already: bump VERSION" || fine "tag $tag is free"
+        [[ -n "$(git branch -r --contains HEAD)" ]] && fine "HEAD ($(git rev-parse --short HEAD)) is on GitHub" \
+            || problem "HEAD isn't on GitHub yet: git push"
+    else
+        problem "can't reach origin (git fetch)"
+    fi
+    for t in docker cmake ninja; do command -v "$t" >/dev/null || problem "no $t"; done
+fi
+[[ $pre == 1 ]] && echo "  · a pre-release on GitHub" || echo "  · a full release on GitHub"
+if [[ $problems -gt 0 ]]; then
+    [[ $publish == 1 || $check == 1 || $dirty == 0 ]] && die "$problems problem(s): nothing done"
+fi
+if [[ $check == 1 ]]; then
+    echo
+    echo "Ready: packaging/release, then packaging/release --publish"
+    exit 0
+fi
+
+# --- The build --------------------------------------------------------------
+built=$( [[ -f "$out/COMMIT" ]] && cat "$out/COMMIT" || true)
+if [[ $publish == 1 && "$built" == "$head" && -f "$out/SHA256SUMS" ]]; then
+    step "using the build in $out (made from $head)"
+    (cd "$out" && sha256sum --quiet -c SHA256SUMS) || die "$out doesn't match its SHA256SUMS: build again"
+else
+    if [[ $tests == 1 ]]; then
+        step "tests"
+        cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
+        cmake --build build-release
+        if [[ $media == 1 ]]; then
+            ctest --test-dir build-release --output-on-failure
+        else
+            ctest --test-dir build-release --output-on-failure -L unit
+        fi
+    fi
+    rm -rf "$out"
+    mkdir -p "$out"
+    if [[ $windows == 1 ]]; then
+        step "Windows zip (Docker)"
+        packaging/windows/build
+        cp "dist/fennectv-$version-win64.zip" "$out/"
+    fi
+    if [[ $linux == 1 ]]; then
+        step "Linux AppImage (Docker)"
+        packaging/appimage/build
+        cp "dist/FennecTV-$version-x86_64.AppImage" "$out/"
+    fi
+    step "source"
+    git archive --format=tar.gz --prefix="fennectv-$version/" -o "$out/fennectv-$version-src.tar.gz" HEAD
+    (cd "$out" && shopt -s nullglob && sha256sum -- *.AppImage *.zip *.tar.gz >SHA256SUMS)
+    # what it was made from; "-dirty" never gets published
+    if [[ -n "$(git status --porcelain)" ]]; then echo "$head-dirty" >"$out/COMMIT"; else echo "$head" >"$out/COMMIT"; fi
+fi
+
+# The notes: the changelog's section, the downloads, how to run it.
+{
+    printf '%s\n\n## Downloads\n\n| File | For |\n|---|---|\n' "$notes"
+    for f in "$out"/*.AppImage "$out"/*-win64.zip "$out"/*-src.tar.gz; do
+        [[ -e "$f" ]] || continue
+        case "$(basename "$f")" in
+            *.AppImage) echo "| \`$(basename "$f")\` | Linux x86-64, glibc 2.39 or newer. Both programs in one file: \`chmod +x\` it, then \`./$(basename "$f") tx --help\` (send) or \`rx --play\` (receive); or \`--install\` once for \`fennectv-tx\` and \`fennectv-rx\` in ~/.local/bin |" ;;
+            *-win64.zip) echo "| \`$(basename "$f")\` | Windows 10 or newer, x86-64: unzip, \`fennectv-tx.exe --help\` |" ;;
+            *-src.tar.gz) echo "| \`$(basename "$f")\` | the source (README.md, Building) |" ;;
+        esac
+    done
+    printf '\nCheck them: `sha256sum -c SHA256SUMS`. Senders and receivers must share the\nbroadcast group (`--version`): this release is `%s`.\n\n' \
+        "$(sed -n 's/.*GROUP = "\(.*\)";/\1/p' core/include/fennectv/protocol.h)"
+    # how to run it, the same in every release (packaging/release-notes)
+    sed "s/@VERSION@/$version/g" packaging/release-notes/how-to-run.md
+} >"$out/NOTES.md"
+
+step "$out"
+ls -lh "$out"
+
+if [[ $publish == 1 ]]; then
+    step "publishing $title"
+    git tag -a "$tag" -m "$title"
+    git push origin "$tag"
+    files=()
+    for f in "$out"/*.zip "$out"/*.AppImage "$out"/*.tar.gz "$out"/SHA256SUMS; do [[ -e "$f" ]] && files+=("$f"); done
+    flags=(--verify-tag)
+    [[ $draft == 1 ]] && flags+=(--draft)
+    [[ $pre == 1 ]] && flags+=(--prerelease)
+    gh release create "$tag" "${files[@]}" --title "$title" --notes-file "$out/NOTES.md" "${flags[@]}"
+    gh release view "$tag" --json url --jq .url
+else
+    echo
+    echo "Not published. Read $out/NOTES.md; when it all looks right:"
+    echo "  packaging/release --publish"
+fi

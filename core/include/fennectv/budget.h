@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "fennectv/protocol.h"
 #include "ragtime/link/Data2GLink.h"
 
 namespace fennectv
@@ -37,7 +38,7 @@ struct Framing
 {
     int framesPerCodeword = 1;
     size_t frameBytes = 0;    // every frame this long
-    size_t payloadBytes = 0;  // the frame less its header
+    size_t payloadBytes = 0;  // the frame less its header (a byte less where a GOP starts)
 };
 
 // The fewest frames to a codeword that keep each within MAX_FRAME_BYTES:
@@ -55,10 +56,22 @@ struct BurstPlan
     int frames = 0;
     double airSeconds = 0;
 
-    size_t capacityBytes() const { return (size_t)frames * framing.payloadBytes; }
+    // What the burst carries with `gops` GOPs in it.
+    size_t capacityBytes(int gops) const { return burstCapacity(framing.payloadBytes, frames, gops); }
     // The codeword a frame travels in, counted from the first data codeword.
     int codewordOf(int idx) const { return idx / framing.framesPerCodeword; }
 };
+
+// A burst made of its GOPs' codings. Each GOP has a few to choose from
+// (bytes, pictures left out); one each is picked: the fewest pictures left
+// out, then the most bytes, within capacity. Which, by GOP; empty if
+// nothing fits.
+struct Coding
+{
+    size_t bytes = 0;
+    int dropped = 0;
+};
+std::vector<size_t> bestFill(const std::vector<std::vector<Coding>>& gops, size_t capacity);
 
 // Nothing for a mode with no room.
 std::optional<BurstPlan> planBurst(const ModeInfo& mode, double seconds = BROADCAST_SECONDS, bool dupControl = false);

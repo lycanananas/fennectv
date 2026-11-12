@@ -1,5 +1,7 @@
 #include "fennectv/budget.h"
 
+#include <functional>
+
 #include <algorithm>
 #include <cmath>
 
@@ -67,6 +69,37 @@ Framing framingFor(const ModeInfo& mode)
         }
     }
     return Framing{};
+}
+
+std::vector<size_t> bestFill(const std::vector<std::vector<Coding>>& gops, size_t capacity)
+{
+    std::vector<size_t> pick(gops.size(), 0), best;
+    if (gops.empty()) return best;
+    for (const auto& g : gops)
+        if (g.empty()) return best;
+    int bestDropped = 1 << 30;
+    size_t bestBytes = 0;
+    // Every combination: a few GOPs of a few codings each.
+    std::function<void(size_t, size_t, int)> walk = [&](size_t g, size_t bytes, int dropped) {
+        if (bytes > capacity || dropped > bestDropped) return;
+        if (g == gops.size())
+        {
+            if (dropped < bestDropped || bytes > bestBytes)
+            {
+                best = pick;
+                bestDropped = dropped;
+                bestBytes = bytes;
+            }
+            return;
+        }
+        for (size_t k = 0; k < gops[g].size(); k++)
+        {
+            pick[g] = k;
+            walk(g + 1, bytes + gops[g][k].bytes, dropped + gops[g][k].dropped);
+        }
+    };
+    walk(0, 0, 0);
+    return best;
 }
 
 std::optional<BurstPlan> planBurst(const ModeInfo& mode, double seconds, bool dupControl)

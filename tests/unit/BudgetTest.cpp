@@ -25,9 +25,9 @@ void q3kPlan()
     CHECK_EQ(p->dataCodewords, 19);
     CHECK_EQ(p->framing.framesPerCodeword, 1);
     CHECK_EQ(p->framing.frameBytes, (size_t)233);
-    CHECK_EQ(p->framing.payloadBytes, (size_t)229);
+    CHECK_EQ(p->framing.payloadBytes, (size_t)231);
     CHECK_EQ(p->frames, 19);
-    CHECK_EQ(p->capacityBytes(), (size_t)19 * 229);
+    CHECK_EQ(p->capacityBytes(4), (size_t)19 * 231 - 4);  // a byte for each GOP start
     CHECK(p->airSeconds <= BROADCAST_SECONDS);
     CHECK(p->airSeconds > 11.5);
 }
@@ -40,9 +40,9 @@ void z8kPlan()
     CHECK_EQ(p->dataCodewords, 39);
     CHECK_EQ(p->framing.framesPerCodeword, 2);  // a 293 B frame is over 255
     CHECK_EQ(p->framing.frameBytes, (size_t)145);
-    CHECK_EQ(p->framing.payloadBytes, (size_t)141);
+    CHECK_EQ(p->framing.payloadBytes, (size_t)143);
     CHECK_EQ(p->frames, 78);
-    CHECK_EQ(p->capacityBytes(), (size_t)10998);
+    CHECK_EQ(p->capacityBytes(4), (size_t)11150);
     CHECK_EQ(p->codewordOf(0), 0);
     CHECK_EQ(p->codewordOf(1), 0);
     CHECK_EQ(p->codewordOf(77), 38);
@@ -95,8 +95,28 @@ void edges()
 
 } // namespace
 
+// One GOP's too big a coding goes where another left room; fewer pictures
+// left out beat more bytes.
+void bestFillPicks()
+{
+    // shares of 100 each: GOP 0 undershot (80), GOP 1 overshot (115) and
+    // fell short (90) on its tries
+    std::vector<std::vector<Coding>> gops = {{{80, 0}, {70, 0}}, {{90, 0}, {115, 0}}};
+    auto pick = bestFill(gops, 200);
+    CHECK(pick == std::vector<size_t>({0, 1}));  // 195
+    pick = bestFill(gops, 190);
+    CHECK(pick == std::vector<size_t>({1, 1}));  // 185
+    // a coding with pictures dropped only when nothing whole fits
+    gops = {{{120, 2}, {150, 0}}, {{60, 0}}};
+    CHECK(bestFill(gops, 200) == std::vector<size_t>({0, 0}));
+    CHECK(bestFill(gops, 210) == std::vector<size_t>({1, 0}));
+    CHECK(bestFill(gops, 100).empty());
+    CHECK(bestFill({{{10, 0}}, {}}, 100).empty());
+}
+
 int main()
 {
+    bestFillPicks();
     q3kPlan();
     z8kPlan();
     framesFitTheBurst();

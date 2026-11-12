@@ -1,0 +1,62 @@
+#!/bin/sh
+# FennecTV's AppImage holds two programs, fennectv-tx and fennectv-rx:
+#   FennecTV.AppImage tx --source ...      run fennectv-tx
+#   FennecTV.AppImage rx --play            run fennectv-rx
+#   FennecTV.AppImage --install            fennectv-tx and fennectv-rx in ~/.local/bin
+#   FennecTV.AppImage --uninstall          take them away again
+# A link to the AppImage named fennectv-tx or fennectv-rx runs that one.
+HERE="$(dirname "$(readlink -f "$0")")"
+# the AppImage file itself (the runtime sets APPIMAGE), for --install
+SELF="${APPIMAGE:-$(readlink -f "$0")}"
+BIN="${XDG_BIN_HOME:-$HOME/.local/bin}"
+
+# what linuxdeploy's plugins set up (Qt's plugin paths)
+for hook in "$HERE"/apprun-hooks/*.sh; do
+    [ -e "$hook" ] && . "$hook"
+done
+
+case "$(basename "${ARGV0:-$0}")" in
+    *fennectv-tx*) exec "$HERE/usr/bin/fennectv-tx" "$@" ;;
+    *fennectv-rx*) exec "$HERE/usr/bin/fennectv-rx" "$@" ;;
+esac
+
+case "${1:-}" in
+    tx) shift; exec "$HERE/usr/bin/fennectv-tx" "$@" ;;
+    rx) shift; exec "$HERE/usr/bin/fennectv-rx" "$@" ;;
+    --version) exec "$HERE/usr/bin/fennectv-tx" --version ;;
+    --install)
+        mkdir -p "$BIN" || exit 1
+        for p in fennectv-tx fennectv-rx; do
+            ln -sfn "$SELF" "$BIN/$p" || exit 1
+            echo "$BIN/$p -> $SELF"
+        done
+        case ":$PATH:" in
+            *":$BIN:"*) echo "Now: fennectv-tx --help, fennectv-rx --play" ;;
+            *) echo "$BIN isn't on your PATH: add it (export PATH=\"$BIN:\$PATH\" in ~/.profile)" ;;
+        esac
+        echo "The links point at this file: move it, and run --install again."
+        exit 0 ;;
+    --uninstall)
+        for p in fennectv-tx fennectv-rx; do
+            if [ -L "$BIN/$p" ]; then rm -f "$BIN/$p" && echo "removed $BIN/$p"; fi
+        done
+        exit 0 ;;
+esac
+
+N="$(basename "$SELF")"
+cat <<USAGE
+FennecTV: television over the Data2G HF modem. This one file holds both
+programs; say which one to run:
+
+  ./$N tx --source film.mp4 --call YOURCALL    send     (tx --help for all options)
+  ./$N rx --play                               receive and watch (rx --help)
+
+Or once:
+
+  ./$N --install      puts fennectv-tx and fennectv-rx in $BIN
+  fennectv-tx --source film.mp4 --call YOURCALL
+  fennectv-rx --play
+
+Both need a running data2g-host (command port 8300, KISS 8100 by default).
+USAGE
+[ -z "${1:-}" ] && exit 0 || exit 2

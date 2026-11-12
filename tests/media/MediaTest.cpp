@@ -43,43 +43,43 @@ std::vector<Picture> read(const std::string& video, double start, const VideoFor
     return pics;
 }
 
-// The unit is a random access point: AV1, a sequence header and a key
-// frame (frame header: show_existing_frame 0, frame_type KEY); VVC, an SPS
-// and an IDR slice.
+// The unit, after the air and back, is a random access point: AV1, a
+// sequence header and a key frame (frame header: show_existing_frame 0,
+// frame_type KEY); VVC, an SPS and an IDR slice.
 bool startsClean(Codec codec, const Bytes& unit)
 {
-    Bytes air = toAir(codec, unit);
+    const Bytes back = fromAir(codec, toAir(codec, unit));
     bool seq = false, key = false;
-    for (size_t pos = 0; pos < air.size();)
+    if (codec == Codec::Av1)
     {
-        size_t len = 0, at = pos;
-        int type = 0;
-        if (codec == Codec::Av1)
+        for (size_t pos = 0; pos < back.size();)
         {
-            uint8_t h = air[pos];
-            type = (h >> 3) & 0x0F;
-            at = pos + 1 + ((h >> 2) & 1);
-        }
-        for (int i = 0;; i++)
-        {
-            uint8_t b = air[at++];
-            len |= (size_t)(b & 0x7F) << (7 * i);
-            if (!(b & 0x80)) break;
-        }
-        if (codec == Codec::Av1)
-        {
+            const uint8_t h = back[pos];
+            const int type = (h >> 3) & 0x0F;
+            size_t at = pos + 1 + ((h >> 2) & 1), len = 0;
+            for (int i = 0;; i++)
+            {
+                uint8_t b = back[at++];
+                len |= (size_t)(b & 0x7F) << (7 * i);
+                if (!(b & 0x80)) break;
+            }
             if (type == 1) seq = true;
             // reduced_still_picture_header is 0 here: the first bits are
             // show_existing_frame (1) and frame_type (2), KEY_FRAME = 0
-            if ((type == 6 || type == 3) && len > 0) key = key || (air[at] & 0xE0) == 0;
+            if ((type == 6 || type == 3) && len > 0) key = key || (back[at] & 0xE0) == 0;
+            pos = at + len;
         }
-        else
-        {
-            int nal = air[at + 1] >> 3;
-            if (nal == 15) seq = true;
-            if (nal == 7 || nal == 8) key = true;  // IDR_W_RADL, IDR_N_LP
-        }
-        pos = at + len;
+    }
+    else
+    {
+        // Annex B: the byte after each start code begins a NAL header
+        for (size_t i = 0; i + 4 < back.size(); i++)
+            if (back[i] == 0 && back[i + 1] == 0 && back[i + 2] == 1)
+            {
+                const int nal = back[i + 4] >> 3;
+                if (nal == 15) seq = true;
+                if (nal == 7 || nal == 8) key = true;  // IDR_W_RADL, IDR_N_LP
+            }
     }
     return seq && key;
 }
@@ -121,6 +121,8 @@ void gear(const std::string& video, double start, const ModeInfo& mode, VideoFor
     EncoderOptions opts;
     opts.bFrames = bFrames;
 
+    Bytes lastParams;
+    ParamCache cache;
     for (int b = 0; b < bursts; b++)
     {
         auto t0 = std::chrono::steady_clock::now();
@@ -132,10 +134,10 @@ void gear(const std::string& video, double start, const ModeInfo& mode, VideoFor
             h.fps = (uint8_t)fmt.fps;
             h.first = (uint8_t)first;
             h.burstPictures = (uint8_t)perBurst;
-            h.osd = "N0CALL";
+            if (g == 0) h.osd = "N0CALL";  // once a burst
             std::vector<Picture> pics(all.begin() + b * perBurst + first,
                                       all.begin() + b * perBurst + first + split[(size_t)g]);
-            const size_t share = plan->capacityBytes() * split[(size_t)g] / perBurst;
+            const size_t share = plan->capacityBytes(nGops) * split[(size_t)g] / perBurst;
             first += split[(size_t)g];
             coding.push_back(std::async(std::launch::async, [=] {
                 auto enc = makeEncoder(codec, fmt, opts);
@@ -144,33 +146,58 @@ void gear(const std::string& video, double start, const ModeInfo& mode, VideoFor
                 Encoder::Fit fit;
                 std::string err;
                 CHECK(enc->encodeToFit(
-                    pics, share, 0.95, 0.05, 6, [&](const std::vector<Bytes>& p) { return gopBytes(codec, h, p); },
-                    gop.units, fit, &err));
+                    pics, share, 1.0, 0.04, 6,
+                    [&](const std::vector<Bytes>& p) { return gopBytes(codec, h, p, g == 0); }, gop.units, fit,
+                    &err));
+                gop.params = g == 0;
                 if (!err.empty()) std::printf("  %s\n", err.c_str());
                 gop.header.count = (uint8_t)gop.units.size();
                 return std::make_pair(std::move(gop), fit);
             }));
         }
+        // As the transmitter does: the burst from the best mix of codings.
         std::vector<Gop> gops;
-        size_t bytes = 0;
-        int kept = 0, tries = 0;
+        std::vector<Encoder::Fit> fits;
+        std::vector<std::vector<Coding>> sizes;
+        std::vector<std::vector<std::vector<Bytes>>> choices;
+        int tries = 0;
         for (auto& c : coding)
         {
             auto [gop, fit] = c.get();
-            CHECK(fit.fits);
-            bytes += gopBytes(codec, gop.header, gop.units);
-            kept += (int)gop.units.size();
             tries += fit.tries;
+            std::vector<Coding> s;
+            std::vector<std::vector<Bytes>> ch;
+            auto add = [&](const std::vector<Bytes>& u, int dropped) {
+                GopHeader h = gop.header;
+                h.count = (uint8_t)u.size();
+                s.push_back({gopBytes(codec, h, u, gop.params), dropped});
+                ch.push_back(u);
+            };
+            if (fit.fits) add(gop.units, fit.dropped);
+            for (const auto& t : fit.codings) add(t.units, 0);
+            sizes.push_back(s);
+            choices.push_back(ch);
             gops.push_back(std::move(gop));
+        }
+        const auto pick = bestFill(sizes, plan->capacityBytes(nGops));
+        CHECK(!pick.empty());
+        size_t bytes = 0;
+        int kept = 0;
+        for (size_t g = 0; g < gops.size() && !pick.empty(); g++)
+        {
+            gops[g].units = choices[g][pick[g]];
+            gops[g].header.count = (uint8_t)gops[g].units.size();
+            bytes += sizes[g][pick[g]].bytes;
+            kept += (int)gops[g].units.size();
         }
         double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::printf("%s %s%s %dx%d@%d: burst %d -> %zu GOPs, %zu B of %zu (%.1f%%), %d tries, %d/%d pictures, "
                     "coded in %.1f s\n",
                     mode.name.c_str(), codecName(codec), bFrames ? "+B" : "", fmt.width, fmt.height, fmt.fps, b,
-                    gops.size(), bytes, plan->capacityBytes(), 100.0 * bytes / plan->capacityBytes(), tries, kept,
+                    gops.size(), bytes, plan->capacityBytes(nGops), 100.0 * bytes / plan->capacityBytes(nGops), tries, kept,
                     perBurst, secs);
-        CHECK(bytes <= plan->capacityBytes());
-        CHECK(bytes * 100 >= plan->capacityBytes() * 85);
+        CHECK(bytes <= plan->capacityBytes(nGops));
+        CHECK(bytes * 100 >= plan->capacityBytes(nGops) * 90);
         CHECK(kept * 10 >= perBurst * 9);  // a hard GOP loses a few at most
 
         // Every picture of every GOP comes back, each in its place once,
@@ -180,6 +207,11 @@ void gear(const std::string& video, double start, const ModeInfo& mode, VideoFor
         for (const Gop& g : gops)
         {
             CHECK(startsClean(codec, g.units[0]));
+            // the same parameters in every GOP, so they can go once a burst
+            CHECK(paramsOf(codec, g.units[0]) == paramsOf(codec, gops[0].units[0]));
+            CHECK(!paramsOf(codec, g.units[0]).empty());
+            if (lastParams.empty()) lastParams = paramsOf(codec, g.units[0]);
+            CHECK(paramsOf(codec, g.units[0]) == lastParams);  // and burst to burst
             std::string err;
             std::vector<Bytes> units;
             for (const Bytes& u : g.units) units.push_back(fromAir(codec, toAir(codec, u)));
@@ -193,13 +225,13 @@ void gear(const std::string& video, double start, const ModeInfo& mode, VideoFor
         CHECK(frames.has_value());
         if (!frames) continue;
         // Lose the frame in the middle of GOP 1.
-        size_t g0 = gopBytes(codec, gops[0].header, gops[0].units);
-        size_t g1 = gopBytes(codec, gops[1].header, gops[1].units);
+        size_t g0 = gopBytes(codec, gops[0].header, gops[0].units, true);
+        size_t g1 = gopBytes(codec, gops[1].header, gops[1].units, false);
         const int lost = (int)((g0 + g1 * 2 / 3) / P);
         std::vector<std::optional<DecodedFrame>> got(frames->size());
         for (size_t i = 0; i < frames->size(); i++)
             if ((int)i != lost) got[i] = decodeFrame((*frames)[i]);
-        auto received = parseBurst(got);
+        auto received = parseBurst(got, &cache);
         CHECK(received.size() >= gops.size() - 1);
         size_t shown = 0, sent = 0;
         for (auto& g : gops) sent += g.units.size();

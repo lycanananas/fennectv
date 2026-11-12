@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- FennecTV: a television with fennec ears -->
+  <path d="M58 92 L40 14 L112 76 Z" fill="#e8a25c" stroke="#5a3418" stroke-width="8" stroke-linejoin="round"/>
+  <path d="M198 92 L216 14 L144 76 Z" fill="#e8a25c" stroke="#5a3418" stroke-width="8" stroke-linejoin="round"/>
+  <path d="M62 78 L52 34 L94 72 Z" fill="#f6d2b0"/>
+  <path d="M194 78 L204 34 L162 72 Z" fill="#f6d2b0"/>
+  <rect x="20" y="70" width="216" height="160" rx="28" fill="#e8a25c" stroke="#5a3418" stroke-width="8"/>
+  <rect x="44" y="94" width="168" height="112" rx="14" fill="#1f2a33"/>
+  <path d="M60 176 C84 140 100 186 124 150 S168 130 196 160" fill="none" stroke="#7fd3c0" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="98" cy="130" r="9" fill="#7fd3c0"/>
+  <circle cx="158" cy="130" r="9" fill="#7fd3c0"/>
+</svg>
