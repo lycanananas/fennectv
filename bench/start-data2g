@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Starts two data2g-hosts joined by fifos instead of sound cards: the
+# sender's (ports 8300/8100) and the receiver's (8310/8110). Ctrl-C stops
+# both. docs/PLAN.md, "Testing without a radio".
+#
+# Callsigns: N0CALL and N1CALL unless bench/local.env (not in git) sets
+# TX_CALL and RX_CALL, or the options below do.
+#
+#   bench/start-data2g [--tx-call CALL] [--rx-call CALL] [--dir DIR] [-- extra data2g-host options]
+#
+# Then, in two more terminals:
+#   build/fennectv-tx --source VIDEO --call TX_CALL
+#   build/fennectv-rx --cmd 8310 --kiss 8110 --play
+set -euo pipefail
+
+TX_CALL=N0CALL
+RX_CALL=N1CALL
+LOCAL_ENV="$(dirname "$0")/local.env"
+# shellcheck source=/dev/null
+[[ -f "$LOCAL_ENV" ]] && source "$LOCAL_ENV"
+DIR=""
+HOST_BIN="${DATA2G_HOST:-data2g-host}"
+EXTRA=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --tx-call) TX_CALL="$2"; shift 2 ;;
+        --rx-call) RX_CALL="$2"; shift 2 ;;
+        --dir) DIR="$2"; shift 2 ;;
+        --) shift; EXTRA=("$@"); break ;;
+        -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown option: $1" >&2; exit 2 ;;
+    esac
+done
+
+command -v "$HOST_BIN" >/dev/null || { echo "no $HOST_BIN on PATH (set DATA2G_HOST)" >&2; exit 1; }
+for p in 8300 8301 8100 8310 8311 8110; do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
+        echo "port $p is taken: is another data2g-host running?" >&2
+        exit 1
+    fi
+done
+
+if [[ -z "$DIR" ]]; then DIR="$(mktemp -d -t fennectv-bench.XXXXXX)"; fi
+mkdir -p "$DIR"
+rm -f "$DIR/tx_to_rx" "$DIR/rx_to_tx"
+mkfifo "$DIR/tx_to_rx" "$DIR/rx_to_tx"
+
+pids=()
+cleanup() {
+    trap - INT TERM EXIT
+    echo
+    echo "stopping the hosts..."
+    kill "${pids[@]}" 2>/dev/null || true
+    wait 2>/dev/null || true
+    rm -f "$DIR/tx_to_rx" "$DIR/rx_to_tx"
+}
+trap cleanup INT TERM EXIT
+
+"$HOST_BIN" --mycall "$TX_CALL" --no-rig --command-port 8300 --kiss-port 8100 \
+    --audio-io "pipe:$DIR/rx_to_tx,$DIR/tx_to_rx" "${EXTRA[@]}" >"$DIR/tx-host.log" 2>&1 &
+pids+=($!)
+"$HOST_BIN" --mycall "$RX_CALL" --no-rig --command-port 8310 --kiss-port 8110 \
+    --audio-io "pipe:$DIR/tx_to_rx,$DIR/rx_to_tx" "${EXTRA[@]}" >"$DIR/rx-host.log" 2>&1 &
+pids+=($!)
+
+# Up once both command ports answer.
+for _ in $(seq 50); do
+    if (exec 3<>/dev/tcp/127.0.0.1/8300) 2>/dev/null && (exec 3<>/dev/tcp/127.0.0.1/8310) 2>/dev/null; then
+        break
+    fi
+    sleep 0.2
+done
+
+cat <<EOF
+data2g-host $TX_CALL (sender):   command 8300, KISS 8100, log $DIR/tx-host.log
+data2g-host $RX_CALL (receiver): command 8310, KISS 8110, log $DIR/rx-host.log
+
+In two more terminals:
+  fennectv-tx --source VIDEO --call $TX_CALL
+  fennectv-rx --cmd 8310 --kiss 8110 --play
+
+Ctrl-C here stops both hosts.
+EOF
+
+tail -n 0 -F "$DIR/tx-host.log" "$DIR/rx-host.log" | grep --line-buffered -E "PTT|BCAST|client|ERROR|WARN" &
+pids+=($!)
+wait "${pids[0]}" "${pids[1]}"
