@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Builds FennecTV for Windows (x86-64, MSYS2 UCRT64 libraries) in Docker,
+# nothing installed on the host:
+#
+#   packaging/windows/build
+#
+# The image (fennectv-win) is built first; Docker's cache keeps its big
+# layers (MSYS2 packages, VVenC/VVdeC), so after the first run this takes
+# seconds. The source is mounted read-only; the build goes to build-win/
+# (incremental, with ccache) and the zip to dist/, both owned by you.
+#
+# To throw it all away:
+#   docker image rm fennectv-win && rm -rf build-win dist
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(cd "$here/../.." && pwd)
+
+docker build -t fennectv-win "$here"
+mkdir -p "$repo/build-win" "$repo/dist"
+docker run --rm \
+    --user "$(id -u):$(id -g)" -e HOME=/tmp \
+    -v "$repo:/src:ro" \
+    -v "$repo/build-win:/src/build-win" \
+    -v "$repo/dist:/src/dist" \
+    fennectv-win bash /src/packaging/windows/in-container.sh "$@"
